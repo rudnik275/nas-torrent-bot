@@ -332,7 +332,7 @@ function startDiskHealthWatcher({ config, store, synology, ownerNotifier, settin
   runPollingLoop({ intervalMs: config.diskHealthPollMs, tick: () => watcher.check(), name: 'DiskHealthWatcher' })
 }
 
-function startAutoCleaner({ config, store, synology, ownerNotifier, settings }: WatcherDeps): void {
+function startAutoCleaner({ config, store, synology, settings }: WatcherDeps): void {
   const cleaner = new AutoCleaner({
     getCompleted: (cutoffMs) => Promise.resolve(store.getCompletedBefore(cutoffMs)),
     deleteTask: (taskId) => synology.deleteTask(taskId),
@@ -340,9 +340,7 @@ function startAutoCleaner({ config, store, synology, ownerNotifier, settings }: 
     clearNotifDedup: (taskId) => { store.clearAllNotifFired(taskId); return Promise.resolve() },
     sweepOrphanNotifDedup: (cutoffMs) => { store.sweepOrphanNotifDedup(cutoffMs); return Promise.resolve() },
     pruneExpiredStashes: () => { store.pruneExpiredStashes(); return Promise.resolve() },
-    notify: (message) => ownerNotifier.send('torrents', message, {
-      replyMarkup: openMiniAppButton(config.miniappUrl, 'downloads'),
-    }),
+    // No notify: auto-cleanup is silent housekeeping — log only, no owner push.
     retentionDays: () => settings.get().autoCleanerRetentionDays,
     now: () => Date.now(),
   })

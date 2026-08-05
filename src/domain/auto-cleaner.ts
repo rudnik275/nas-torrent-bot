@@ -13,8 +13,6 @@ export interface AutoCleanerDeps {
   sweepOrphanNotifDedup: (cutoffMs: number) => Promise<void>
   /** Purge expired add-intake stashes (.torrent blobs / magnet URIs) (#300). */
   pruneExpiredStashes: () => Promise<void>
-  /** Send a notification message to the owner. */
-  notify: (message: string) => Promise<void>
   /**
    * Number of days to retain completed task entries. Default 7.
    * A getter is re-read on every tick so a Settings change applies live (#305).
@@ -32,9 +30,11 @@ export interface AutoCleanerDeps {
  *  2. For each, call deleteTask (removes task entry from DownloadStation, keeps files).
  *  3. On success, call removeCompletion + clearNotifDedup to clean up dedup rows.
  *  4. On Synology error: log and skip (next tick will retry).
- *  5. If any tasks were deleted, send one summary push to the owner.
- *  6. Housekeeping (#300, every tick): sweep orphan notif_dedup rows older than
+ *  5. Housekeeping (#300, every tick): sweep orphan notif_dedup rows older than
  *     the retention cutoff and prune expired torrent stashes.
+ *
+ * Cleanup is silent by design: it is routine housekeeping the owner did not ask
+ * for, so the result goes to the log only — never a Telegram push.
  */
 export class AutoCleaner {
   private readonly deps: AutoCleanerDeps
@@ -75,8 +75,8 @@ export class AutoCleaner {
     }
 
     if (deletedCount > 0) {
-      await this.deps.notify(
-        `🧹 Автоматически удалено ${deletedCount} завершённых задач старше ${retentionDays} дней (файлы сохранены)`
+      console.log(
+        `[AutoCleaner] Removed ${deletedCount} completed task(s) older than ${retentionDays} days (files kept)`
       )
     }
   }

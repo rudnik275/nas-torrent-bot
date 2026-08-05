@@ -18,7 +18,6 @@ function makeHarness(opts: {
   dedupCleared: string[]
   sweepCutoffs: number[]
   pruneCalls: number[]
-  notifications: string[]
   completions: Array<{ taskId: string; completedAt: number }>
   deleteError: string | undefined
 } {
@@ -29,7 +28,6 @@ function makeHarness(opts: {
   const dedupCleared: string[] = []
   const sweepCutoffs: number[] = []
   const pruneCalls: number[] = []
-  const notifications: string[] = []
   let deleteError: string | undefined = opts.deleteError
 
   const deps: AutoCleanerDeps = {
@@ -57,23 +55,33 @@ function makeHarness(opts: {
     pruneExpiredStashes: async () => {
       pruneCalls.push(1)
     },
-    notify: async (message: string) => {
-      notifications.push(message)
-    },
     retentionDays,
     now: () => NOW,
   }
 
   const cleaner = new AutoCleaner(deps)
 
-  return { cleaner, deleted, removed, dedupCleared, sweepCutoffs, pruneCalls, notifications, completions, deleteError: opts.deleteError }
+  return { cleaner, deleted, removed, dedupCleared, sweepCutoffs, pruneCalls, completions, deleteError: opts.deleteError }
+}
+
+/** Capture console.log output for the duration of `fn` (cleanup is log-only now). */
+async function captureLog(fn: () => Promise<void>): Promise<string[]> {
+  const lines: string[] = []
+  const original = console.log
+  console.log = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+  try {
+    await fn()
+  } finally {
+    console.log = original
+  }
+  return lines
 }
 
 // ---- Tests ----
 
 describe('AutoCleaner', () => {
   describe('no completions older than retention', () => {
-    it('→ no deletes, no push', async () => {
+    it('→ no deletes', async () => {
       const h = makeHarness({
         completions: [
           { taskId: 'task-1', completedAt: NOW - 6 * DAY_MS }, // 6 days ago — within retention
@@ -85,12 +93,11 @@ describe('AutoCleaner', () => {
 
       expect(h.deleted).toHaveLength(0)
       expect(h.removed).toHaveLength(0)
-      expect(h.notifications).toHaveLength(0)
     })
   })
 
   describe('1 completion 8 days old', () => {
-    it('→ 1 delete, 1 removeCompletion, 1 push (first batch)', async () => {
+    it('→ 1 delete, 1 removeCompletion', async () => {
       const h = makeHarness({
         completions: [
           { taskId: 'task-old', completedAt: NOW - 8 * DAY_MS }, // 8 days ago — past retention
@@ -101,13 +108,11 @@ describe('AutoCleaner', () => {
 
       expect(h.deleted).toEqual(['task-old'])
       expect(h.removed).toEqual(['task-old'])
-      expect(h.notifications).toHaveLength(1)
-      expect(h.notifications[0]).toContain('1')
     })
   })
 
   describe('3 completions older than retention', () => {
-    it('→ 3 deletes, 3 removeCompletion, 1 push with N=3', async () => {
+    it('→ 3 deletes, 3 removeCompletion', async () => {
       const h = makeHarness({
         completions: [
           { taskId: 'task-a', completedAt: NOW - 10 * DAY_MS },
@@ -123,20 +128,17 @@ describe('AutoCleaner', () => {
       expect(h.deleted).toContain('task-b')
       expect(h.deleted).toContain('task-c')
       expect(h.removed).toHaveLength(3)
-      expect(h.notifications).toHaveLength(1)
-      expect(h.notifications[0]).toContain('3')
     })
   })
 
   describe('second tick after successful clean', () => {
-    it('→ more old completions deleted and a second push fires (one per non-empty run)', async () => {
+    it('→ more old completions deleted on the next tick', async () => {
       const completions: Array<{ taskId: string; completedAt: number }> = [
         { taskId: 'task-first', completedAt: NOW - 8 * DAY_MS },
       ]
 
       const deleted: string[] = []
       const removed: string[] = []
-      const notifications: string[] = []
 
       const deps: AutoCleanerDeps = {
         getCompleted: async (cutoffMs: number) => {
@@ -156,30 +158,28 @@ describe('AutoCleaner', () => {
         clearNotifDedup: async () => {},
         sweepOrphanNotifDedup: async () => {},
         pruneExpiredStashes: async () => {},
-        notify: async (msg: string) => { notifications.push(msg) },
         retentionDays: 7,
         now: () => NOW,
       }
 
       const cleaner = new AutoCleaner(deps)
 
-      // First tick — should clean task-first and push
+      // First tick — should clean task-first
       await cleaner.cleanup()
-      expect(notifications).toHaveLength(1)
       expect(deleted).toContain('task-first')
+      expect(removed).toContain('task-first')
 
       // Add another old task
       completions.push({ taskId: 'task-second', completedAt: NOW - 9 * DAY_MS })
 
-      // Second tick — should delete task-second AND push a second notification
+      // Second tick — should delete task-second
       await cleaner.cleanup()
       expect(deleted).toContain('task-second')
-      expect(notifications).toHaveLength(2)
     })
   })
 
   describe('Synology delete fails', () => {
-    it('→ no removeCompletion, no push (retry next tick)', async () => {
+    it('→ no removeCompletion (retry next tick)', async () => {
       const h = makeHarness({
         completions: [
           { taskId: 'task-fail', completedAt: NOW - 8 * DAY_MS },
@@ -191,7 +191,6 @@ describe('AutoCleaner', () => {
 
       expect(h.deleted).toHaveLength(0)
       expect(h.removed).toHaveLength(0)
-      expect(h.notifications).toHaveLength(0)
     })
   })
 
@@ -210,7 +209,6 @@ describe('AutoCleaner', () => {
 
       expect(h.deleted).toHaveLength(0)
       expect(h.removed).toHaveLength(0)
-      expect(h.notifications).toHaveLength(0)
     })
   })
 
@@ -235,8 +233,10 @@ describe('AutoCleaner', () => {
     })
   })
 
-  describe('notification message format', () => {
-    it('contains broom emoji and task count', async () => {
+  describe('silent cleanup: no owner push, log only', () => {
+    // Regression guard for the "🧹 Автоматически удалено N задач" push spam:
+    // AutoCleanerDeps has no notification channel at all, so cleanup can only log.
+    it('logs a summary line with the task count instead of pushing', async () => {
       const h = makeHarness({
         completions: [
           { taskId: 'task-1', completedAt: NOW - 8 * DAY_MS },
@@ -244,12 +244,22 @@ describe('AutoCleaner', () => {
         ],
       })
 
-      await h.cleaner.cleanup()
+      const logs = await captureLog(() => h.cleaner.cleanup())
 
-      expect(h.notifications).toHaveLength(1)
-      const msg = h.notifications[0]
-      expect(msg).toContain('🧹')
-      expect(msg).toContain('2')
+      expect(h.deleted).toHaveLength(2)
+      const summary = logs.find((l) => l.includes('[AutoCleaner]'))
+      expect(summary).toBeDefined()
+      expect(summary).toContain('2')
+    })
+
+    it('logs nothing when there was nothing to clean', async () => {
+      const h = makeHarness({
+        completions: [{ taskId: 'task-fresh', completedAt: NOW - 1 * DAY_MS }],
+      })
+
+      const logs = await captureLog(() => h.cleaner.cleanup())
+
+      expect(logs.filter((l) => l.includes('[AutoCleaner]'))).toHaveLength(0)
     })
   })
 
@@ -257,7 +267,6 @@ describe('AutoCleaner', () => {
     it('uses now() from deps, not system time', async () => {
       const customNow = 2_000_000_000_000 // far future
       const deleted: string[] = []
-      const notifications: string[] = []
 
       const deps: AutoCleanerDeps = {
         getCompleted: async (cutoffMs: number) => {
@@ -273,23 +282,20 @@ describe('AutoCleaner', () => {
         clearNotifDedup: async () => {},
         sweepOrphanNotifDedup: async () => {},
         pruneExpiredStashes: async () => {},
-        notify: async (msg) => { notifications.push(msg) },
         retentionDays: 7,
         now: () => customNow,
       }
 
       const cleaner = new AutoCleaner(deps)
-      await cleaner.cleanup()
+      await captureLog(() => cleaner.cleanup())
 
       expect(deleted).toContain('task-x')
-      expect(notifications).toHaveLength(1)
     })
   })
 
   describe('retention as a live getter (#305 runtime settings)', () => {
     it('re-reads retentionDays on every tick', async () => {
       const deleted: string[] = []
-      const notifications: string[] = []
       let retentionDays = 7
       const completions = [{ taskId: 'task-old', completedAt: NOW - 5 * DAY_MS }]
 
@@ -301,7 +307,6 @@ describe('AutoCleaner', () => {
         clearNotifDedup: async () => {},
         sweepOrphanNotifDedup: async () => {},
         pruneExpiredStashes: async () => {},
-        notify: async (msg) => { notifications.push(msg) },
         retentionDays: () => retentionDays,
         now: () => NOW,
       })
@@ -312,9 +317,9 @@ describe('AutoCleaner', () => {
 
       // Settings change between ticks: retention drops to 3 days → deleted now
       retentionDays = 3
-      await cleaner.cleanup()
+      const logs = await captureLog(() => cleaner.cleanup())
       expect(deleted).toEqual(['task-old'])
-      expect(notifications[0]).toContain('3 дней')
+      expect(logs.find((l) => l.includes('[AutoCleaner]'))).toContain('3 days')
     })
   })
 
@@ -354,7 +359,6 @@ describe('AutoCleaner', () => {
 
       expect(h.sweepCutoffs).toEqual([NOW - 7 * DAY_MS])
       expect(h.pruneCalls).toHaveLength(1)
-      expect(h.notifications).toHaveLength(0)
     })
 
     it('runs housekeeping once per tick alongside task cleanup', async () => {
@@ -362,8 +366,10 @@ describe('AutoCleaner', () => {
         completions: [{ taskId: 'task-old', completedAt: NOW - 8 * DAY_MS }],
       })
 
-      await h.cleaner.cleanup()
-      await h.cleaner.cleanup()
+      await captureLog(async () => {
+        await h.cleaner.cleanup()
+        await h.cleaner.cleanup()
+      })
 
       expect(h.sweepCutoffs).toHaveLength(2)
       expect(h.pruneCalls).toHaveLength(2)

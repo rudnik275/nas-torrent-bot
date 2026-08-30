@@ -16,6 +16,22 @@ services:
       TZ: "Europe/Kyiv"
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
+    # The NAS (DS720+) has only 1.7 GB of RAM shared by DSM, Plex, Jellyfin and
+    # every container here. Without a ceiling one container's spike pushes the
+    # others into swap, and on a NAS the swap lives on the same spinning disks
+    # that are already busy — so everyone crawls at once. That is not
+    # hypothetical: on 2026-08-30 a Jellyfin scan ballooned to 949 MB and stalled
+    # an unrelated container for 1.5 hours (load average 18 with an idle CPU,
+    # 40+ MB/s of pure swap paging).
+    #
+    # Measured idle: bot ~74 MB, cloudflared ~20 MB, watchtower ~10 MB. The
+    # limits below leave each roughly 2-12x its idle footprint — enough for real
+    # spikes, low enough that a runaway hits its own ceiling instead of the
+    # machine's. A container that exceeds its limit is OOM-killed and restarted
+    # by `restart: unless-stopped`, which is far cheaper than dragging the whole
+    # NAS into a swap storm.
+    mem_limit: 192m
+    memswap_limit: 256m
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /volume1/docker/synology-bot/data:/usr/src/app/data
@@ -41,12 +57,20 @@ services:
     command: tunnel run
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
+    # See the memory note on `bot` above. Idle ~20 MB; a tunnel has no reason to
+    # grow, so a tight ceiling here is free insurance.
+    mem_limit: 128m
+    memswap_limit: 128m
     environment:
       TUNNEL_TOKEN: ${CF_TUNNEL_TOKEN}
   watchtower:
     image: containrrr/watchtower:latest
     container_name: watchtower
     restart: unless-stopped
+    # See the memory note on `bot` above. Idle ~10 MB; it wakes every 5 minutes
+    # to poll image digests and otherwise sleeps.
+    mem_limit: 128m
+    memswap_limit: 128m
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
